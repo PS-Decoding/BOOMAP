@@ -1191,9 +1191,46 @@
       $("fabSearch")?.classList.add('searched');
       fetchRoadJibunByLatLng(latlng, (road,jibun)=> openSearchOverlayAtPin(label||'-', road, jibun));
     }
+
+    function normalizeAddress(addr) {
+      return addr.replace(/\s+/g, '')
+                .replace(/-/g, '')
+                .replace(/번지/g, '')
+                .trim();
+    }
+
+    function findListingByNormalizedAddress(addrNorm) {
+      for (const listing of LISTINGS) { // LISTINGS = C열 불러온 매물 배열
+        const ln = normalizeAddress(listing.address);
+        if (ln === addrNorm) return listing;
+      }
+      return null;
+    }
+
     function runAddressSearch(q){
       q = (q || $("addrInput")?.value || '').trim();
       if(!q){ showSearchHint("검색어를 입력하세요."); return; }
+
+      geocoder.addressSearch(query, function(results, status) {
+        if (status === kakao.maps.services.Status.OK) {
+          const result = results[0];
+          const latlng = new kakao.maps.LatLng(result.y, result.x);
+
+          // 🔹 여기서 우리 매물과 정규화 주소 비교 먼저
+          const normalized = normalizeAddress(result.road_address?.address_name || result.address.address_name);
+          const match = findListingByNormalizedAddress(normalized);
+
+          if (match) {
+            // 👉 매물 있으면: 기본 마커/인포윈도우 **안 띄우고**
+            openListingPill(match);   // 리스트 카드 열기
+            map.setCenter(latlng);
+            return; // 보라색 핀 찍는 코드 실행 안 함
+          }
+
+          // 👉 매물 없으면 기존 동작 (보라색 핀 + 인포윈도우)
+          placeSearchMarker(latlng, result.address_name);
+        }
+      });
 
       const g = geocoder || new kakao.maps.services.Geocoder();
       g.addressSearch(q, function(res, status){
