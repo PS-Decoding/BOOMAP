@@ -1193,29 +1193,42 @@
     }
 
     function normalizeAddress(raw) {
-      if (!raw) return "";
-      let s = String(raw)
-        .replace(/\s+/g, " ")        // 연속 공백 → 1칸
-        .replace(/[(),]/g, " ")      // 괄호/쉼표 제거
-        .replace(/\s*동\s*/g, "동 ")  // "동" 앞뒤 공백 정리
-        .replace(/\s*호\s*/g, "호 ")  // "호" 앞뒤 공백 정리
-        .trim();
-
-      // 필요한 규칙 더 추가 가능:
-      // - 번지 "123-4" 통일
-      // - 영문 동/로/길 표기 섞임 처리 등
-      return s;
+      if (raw == null) return "";
+      const s = String(raw).trim();
+      let out = s.replace(/\s+/g, " ");
+      out = out
+        .replace(/서울특별시/g, "서울")
+        .replace(/서울시/g, "서울")
+        .replace(/,|·/g, "")
+        .replace(/\(.*?\)/g, "");
+      out = out.replace(/\s/g, "");
+      return out;
     }
 
-    // --- 우리 매물에서 정규화 주소로 일치 항목 찾기 ---
-    // data 배열(매물 목록)과 row.address(C열), row.lat, row.lng를 사용한다고 가정
-    function findListingByNormalizedAddress(addrNorm){
-      if(!addrNorm) return null;
-      for(const row of (window.data || [])){
-        const ln = normalizeAddress(row.address);
-        if(ln && ln === addrNorm) return row;
+    window.__addressIndex = new Map();
+
+    function buildAddressIndex(listings = []) {
+      __addressIndex.clear();
+      for (const it of listings) {
+        const candidates = new Set([
+          it.address,
+          it.roadAddress,
+          it.jibunAddress,
+          it.addr,
+          it.location,
+        ].filter(Boolean));
+        for (const c of candidates) {
+          const key = normalizeAddress(c);
+          if (!key) continue;
+          if (!__addressIndex.has(key)) __addressIndex.set(key, []);
+          __addressIndex.get(key).push(it);
+        }
       }
-      return null;
+    }
+
+    function findListingsByAddress(rawInput) {
+      const key = normalizeAddress(rawInput);
+      return key ? (__addressIndex.get(key) || []) : [];
     }
 
     // --- 매물 카드(또는 pill) 열기: row 기준 위치로 열기 ---
@@ -1251,61 +1264,62 @@
       if(map){ map.setCenter(latlng); }
     }
 
-    // --- 여기부터 문제의 함수: query 정의하고, 정규화 매칭 → 성공 시 기본핀 억제 ---
-    function runAddressSearch(q){
-      q = (q ?? $("addrInput")?.value ?? '').trim();
-      if(!q){ showSearchHint("검색어를 입력하세요."); return; }
+    // === 4) 검색 실행(폼/버튼 공용 핸들러) - 교체본 ===
+    function runAddressSearch(ev) {
+      try {
+        ev && ev.preventDefault && ev.preventDefault();
 
-      const g = geocoder || new kakao.maps.services.Geocoder();
-
-      g.addressSearch(q, function(res, status){
-        if(status === kakao.maps.services.Status.OK && res && res.length){
-          const r = res[0];
-          const latlng = new kakao.maps.LatLng(Number(r.y), Number(r.x));
-
-          const road  = r.road_address?.address_name || null;
-          const jibun = r.address?.address_name       || null;
-
-          // 검색 결과의 도로명/지번 정규화 후보
-          const qNorms = [road, jibun].map(a => a ? normalizeAddress(a) : null).filter(Boolean);
-
-          // 우리 매물에서 정규화 주소가 정확히 같으면 그걸 우선 표시
-          const match = data.find(row => {
-            const rowNorm = row._normAddr || normalizeAddress(row.address || "");
-            return qNorms.includes(rowNorm);
-          });
-
-          if (match) {
-            // 검색 패널/보라핀 억제
-            closeSearchOverlay();
-
-            // 카드 바로 열기 (필터 때문에 마커가 안 보여도 카드 우선)
-            const pos = match._marker?.getPosition() || latlng;
-            smoothPanZoomTo(pos, 1);
-            onceIdle(() => {
-              openCardFor(match, pos, false);
-              nudgeIfEdge(pos);
-            });
-            return; // ← 여기서 끝 (보라색 핀 만들지 않음)
+        // 입력값 읽기냥
+        const inputEl = document.getElementById("addressSearchInput");
+        const q = inputEl ? (inputEl.value || "") : "";
+        if (!q.trim()) {
+          // 비어있을 때의 기존 처리 로직이 있으면 그대로 두고, 없으면 조용히 반환냥
+          if (typeof showSearchEmptyState === "function") {
+            showSearchEmptyState();
           }
-
-          // 매칭 실패 시에만 기본 보라핀 + 검색 패널
-          handlePinAndZoom(latlng, road || jibun || q);
-
-        } else {
-          // 지오코딩 실패 → 키워드 fallback
-          const places = new kakao.maps.services.Places();
-          places.keywordSearch(q, function(r, s){
-            if(s === kakao.maps.services.Status.OK && r && r.length){
-              const item = r[0];
-              const latlng = new kakao.maps.LatLng(Number(item.y), Number(item.x));
-              handlePinAndZoom(latlng, item.place_name || q);
-            } else {
-              showSearchHint("주소를 확인하세요.");
-            }
-          }, { size: 3 });
+          return;
         }
-      });
+
+        // ① 우리 매물 먼저 매칭냥
+        let matched = [];
+        try {
+          if (typeof findListingsByAddress === "function") {
+            matched = findListingsByAddress(q) || [];
+          }
+        } catch (e) {
+          console.warn("[runAddressSearch] findListingsByAddress 실패, 지오코딩으로 fallback", e);
+        }
+
+        if (matched.length > 0) {
+          // 지도/패널은 네가 쓰던 기존 훅들로 그대로 연결해줘냥
+          if (typeof focusMapToListings === "function") focusMapToListings(matched);
+          if (typeof openListingPanel    === "function") openListingPanel(matched);
+          if (typeof closeAddressInfoPanel=== "function") closeAddressInfoPanel();
+          return;
+        }
+
+        // ② 매물이 없으면 지오코딩 → 주소 정보창 흐름냥
+        if (typeof geocodeAddress === "function") {
+          Promise.resolve(geocodeAddress(q)).then(function (geo) {
+            if (geo) {
+              if (typeof moveMapTo           === "function") moveMapTo(geo.lat, geo.lng);
+              if (typeof openAddressInfoPanel=== "function") openAddressInfoPanel(geo);
+              if (typeof closeListingPanel   === "function") closeListingPanel();
+            } else {
+              if (typeof showSearchNoResult  === "function") showSearchNoResult(q);
+            }
+          }).catch(function (e) {
+            console.error("[runAddressSearch] geocodeAddress 오류:", e);
+            if (typeof toastError === "function") toastError("주소 검색 중 오류가 발생했어");
+          });
+        } else {
+          console.warn("[runAddressSearch] geocodeAddress 함수가 없어 지오코딩을 못했어냥");
+          if (typeof showSearchNoResult === "function") showSearchNoResult(q);
+        }
+      } catch (e) {
+        console.error("[runAddressSearch] failed:", e);
+        if (typeof toastError === "function") toastError("주소 검색 중 오류가 발생했어");
+      }
     }
 
     function initSearchUI(){
@@ -2490,6 +2504,36 @@
       bindLegendPanel();
       initSearchUI();
       bindTypeChips();
+
+      // === 3) 부팅/초기화 ===
+      document.addEventListener("DOMContentLoaded", function () {
+        // 네가 이미 쓰는 매물 배열을 그대로 재사용함냥
+        const listings = window.LISTINGS || [];
+
+        // 주소 인덱스 1회 구축(2번에서 만든 함수 사용)냥
+        try {
+          if (typeof buildAddressIndex === "function") {
+            buildAddressIndex(listings);
+          } else {
+            console.warn("[init] buildAddressIndex가 없어 인덱스를 만들지 못했어냥");
+          }
+        } catch (e) {
+          console.error("[init] buildAddressIndex 실패:", e);
+        }
+
+        // 검색 이벤트 연결냥
+        const form = document.getElementById("addressSearchForm");
+        const btn  = document.getElementById("addressSearchBtn");
+        form && form.addEventListener("submit", runAddressSearch);
+        btn  && btn.addEventListener("click", runAddressSearch);
+
+        // 콘솔 디버그 헬퍼(선택)냥
+        window.__ADDR_DBG__ = {
+          find: typeof findListingsByAddress === "function" ? findListingsByAddress : null,
+          norm: typeof normalizeAddress === "function" ? normalizeAddress : null,
+          idx : typeof __addressIndex !== "undefined" ? __addressIndex : null
+        };
+      });
 
       // 타일: idle 2회 후 부트 플래그
       (function () {
