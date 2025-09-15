@@ -1193,12 +1193,15 @@
     }
 
     function normalizeAddress(addr){
-      if(!addr) return "";
-      return String(addr)
-        .replace(/\s+/g, "")
-        .replace(/-/g, "")
-        .replace(/번지/g, "")
+      if (!raw) return "";
+      let s = String(raw)
+        .replace(/\s+/g, " ")
+        .replace(/[(),]/g, " ")
+        .replace(/\s*동\s*/g, "동 ")
+        .replace(/\s*호\s*/g, "호 ")
         .trim();
+      // 숫자-숫자/숫자 패턴 통일 등 추가 규칙 필요하면 계속 보강
+      return s;
     }
 
     // --- 우리 매물에서 정규화 주소로 일치 항목 찾기 ---
@@ -1247,63 +1250,60 @@
 
     // --- 여기부터 문제의 함수: query 정의하고, 정규화 매칭 → 성공 시 기본핀 억제 ---
     function runAddressSearch(q){
-      // ✅ 인자로 오면 그걸 쓰고, 아니면 입력창 값 사용
-      const inputEl = document.getElementById("addrInput");
-      const query = (q != null ? String(q) : (inputEl ? inputEl.value : "")).trim();
+      // ❗ 절대 'query' 쓰지 말고, q 하나만 사용
+      q = (q ?? $("addrInput")?.value ?? '').trim();
+      if(!q){ showSearchHint("검색어를 입력하세요."); return; }
 
-      if(!query){
-        // 힌트 토스트 쓰던 함수 유지
-        if(typeof showSearchHint === "function") showSearchHint("검색어를 입력하세요.");
-        return;
-      }
+      const g = geocoder || new kakao.maps.services.Geocoder();
 
-      const g = window.geocoder || new kakao.maps.services.Geocoder();
-      g.addressSearch(query, function(res, status){
+      g.addressSearch(q, function(res, status){
         if(status === kakao.maps.services.Status.OK && res && res.length){
           const r = res[0];
           const latlng = new kakao.maps.LatLng(Number(r.y), Number(r.x));
-          const label = (r.road_address?.address_name) || (r.address?.address_name) || query;
+          const road  = r.road_address?.address_name || null;
+          const jibun = r.address?.address_name       || null;
 
-          // 🔹 정규화 기준 텍스트(도로명 우선, 없으면 지번)
-          const normalized = normalizeAddress(
-            (r.road_address && r.road_address.address_name) ||
-            (r.address && r.address.address_name) ||
-            ""
-          );
+          // ✅ 정규화 주소 후보(도로명/지번) 생성
+          const qNorms = [road, jibun].map(a => a ? normalizeAddress(a) : null).filter(Boolean);
 
-          // 🔹 우리 매물에서 정규화로 정확 일치 찾기 (필터와 무관하게 찾음)
-          const match = findListingByNormalizedAddress(normalized);
+          // ✅ 우리 매물에서 정규화 주소가 정확히 같은 게 있으면 그걸 우선 노출
+          //    (필터 때문에 마커가 안 보이는 상태라도 카드 열기)
+          const match = data.find(row => {
+            const rowNorm = row._normAddr || normalizeAddress(row.address || "");
+            return qNorms.includes(rowNorm);
+          });
 
-          if(match){
-            // ✅ 매물 있으면: 기본 보라핀/검색패널 **억제**하고 매물 카드 열기
-            openListingPill(match, latlng);
+          if (match) {
+            // 보라색 핀/검색 패널 억제
+            closeSearchOverlay();              // 패널 닫기
+            $("fabSearch")?.classList.add('searched'); // 선택사항: 이펙트 유지 원하면 둠
 
-            // 검색창 스타일이 ‘searched’ 같은 걸로 바뀌는 로직이 있으면 그대로 두되,
-            // 패널은 열지 않도록(= handlePinAndZoom 호출 금지)
-            const fab = document.getElementById("fabSearch");
-            if(fab) fab.classList.add("searched");
-            return; // ← 중요! 아래 기본 핀 로직으로 내려가면 안 됨
+            const pos = match._marker?.getPosition() || latlng;
+            // 보기 좋게 이동 + 카드 오픈
+            smoothPanZoomTo(pos, 1);
+            onceIdle(() => {
+              openCardFor(match, pos, false);
+              nudgeIfEdge(pos);
+            });
+            return; // ← 여기서 끝! (보라색 핀 만들지 않음)
           }
 
-          // ❌ 매물 없으면: 기존 동작(보라색 핀 + 검색 패널)
-          placeSearchMarker(latlng, label);
-          return;
+          // ⬇ 매칭 실패 시에만 기본 보라색 핀 + 검색 패널
+          handlePinAndZoom(latlng, road || jibun || q);
+
+        } else {
+          // 지오코딩 실패 → 키워드 검색 fallback
+          const places = new kakao.maps.services.Places();
+          places.keywordSearch(q, function(r, s){
+            if(s === kakao.maps.services.Status.OK && r && r.length){
+              const item = r[0];
+              const latlng = new kakao.maps.LatLng(Number(item.y), Number(item.x));
+              handlePinAndZoom(latlng, item.place_name || q);
+            } else {
+              showSearchHint("주소를 확인하세요.");
+            }
+          }, { size: 3 });
         }
-
-        // 주소검색 실패 → 장소검색으로 보조
-        const places = new kakao.maps.services.Places();
-        places.keywordSearch(query, function(r, s){
-          if(s === kakao.maps.services.Status.OK && r && r.length){
-            const item = r[0];
-            const latlng = new kakao.maps.LatLng(Number(item.y), Number(item.x));
-            const label = item.place_name || query;
-
-            // 장소검색은 도로명/지번 문자열이 확정적이지 않아 “정규화 매물 일치”는 생략
-            placeSearchMarker(latlng, label);
-          }else{
-            if(typeof showSearchHint === "function") showSearchHint("주소를 확인하세요.");
-          }
-        }, { size: 3 });
       });
     }
 
@@ -2164,6 +2164,7 @@
       const groups = Object.create(null);
 
       data.forEach(function(row){
+        row._normAddr = normalizeAddress(row.address || "");
         const lat = Number(row.lat), lng = Number(row.lng);
         if(!isFinite(lat) || !isFinite(lng)) return;
 
