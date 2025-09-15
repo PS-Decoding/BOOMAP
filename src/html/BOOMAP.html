@@ -834,6 +834,42 @@
       timer: null,
       lastKey: ""            // 직전 호출 키(중복 호출 방지)
     };
+        
+    /* ===== 주소 정규화(간단 키) ===== */
+    function normalizeKRAddr(raw){
+      if(!raw) return "";
+      let s = String(raw)
+        .replace(/^대한민국\s*/,'')           // "대한민국 " 제거
+        .replace(/특별시|광역시/g, '시')      // 서울특별시 → 서울시
+        .replace(/\s+/g,'')                   // 공백 제거
+        .replace(/[.,·\-–—~]/g,'');           // 구두점 제거
+      // 동/로/길 + 번지 패턴을 최대한 살림 (예: 면목동45834, 겸재로30길42 등)
+      // 호수(B101호 같은)는 있으면 그대로 붙여 비교 강화
+      return s.toLowerCase();
+    }
+
+    function isSameNormalizedAddress(a, b){
+      const na = normalizeKRAddr(a);
+      const nb = normalizeKRAddr(b);
+      return !!na && na === nb;
+    }
+
+    function findListingsByNormalizedAddress(addrCandidates){
+      // addrCandidates: [도로명주소, 지번주소, 사용자가 입력한 원문] 같은 여러 후보 배열
+      const norms = (addrCandidates||[])
+        .filter(Boolean)
+        .map(normalizeKRAddr)
+        .filter(Boolean);
+      if(!norms.length) return [];
+
+      // data = 전역 매물 배열 (이미 있음)
+      return data.filter(row=>{
+        const a = row && row.address ? normalizeKRAddr(row.address) : "";
+        if(!a) return false;
+        // 후보 중 하나와 일치하면 통과
+        return norms.includes(a);
+      });
+    }
 
     /* ========== 공통 유틸/포맷 ========== */
     function normalizeNumber(x){
@@ -1164,82 +1200,70 @@
         if(status === kakao.maps.services.Status.OK && res && res.length){
           const r = res[0];
           const latlng = new kakao.maps.LatLng(Number(r.y), Number(r.x));
-          const road   = (r.road_address && r.road_address.address_name) || "";
-          const jibun  = (r.address       && r.address.address_name)     || "";
+          const road   = r.road_address?.address_name || null;
+          const jibun  = r.address?.address_name || null;
           const label  = road || jibun || q;
 
-          // ✅ 1) 우리 매물에서 '정확히 같은 주소' 먼저 찾기 (필터/표시여부 무시)
-          const exact = findListingsByAddressFlexible(road, jibun);
-          if (exact.length){
-            // 여러 개면 검색지점과 가장 가까운 걸 선택
-            let best = exact[0], bestPos = null, bestD = Infinity;
-            const tLat = latlng.getLat(), tLng = latlng.getLng();
-
-            function distToRow(row){
-              const lat = Number(row.lat), lng = Number(row.lng);
-              if(!isFinite(lat)||!isFinite(lng)) return Infinity;
-              const dLat = (lat - tLat) * Math.PI/180;
-              const dLng = (lng - tLng) * Math.PI/180;
-              const a = Math.sin(dLat/2)**2 + Math.cos(tLat*Math.PI/180)*Math.cos(lat*Math.PI/180)*Math.sin(dLng/2)**2;
-              return 2*6371000*Math.asin(Math.sqrt(a));
+          // ① 정규화 매칭 시도 (우리 매물 주소와)
+          const matches = findListingsByNormalizedAddress([road, jibun, q]);
+          if(matches.length){
+            // 우선순위: road 일치 > jibun 일치 > 입력문 일치
+            let chosen = null;
+            const nRoad = normalizeKRAddr(road);
+            const nJib  = normalizeKRAddr(jibun);
+            for(const row of matches){
+              const na = normalizeKRAddr(row.address);
+              if(nRoad && na===nRoad){ chosen = row; break; }
             }
-
-            for(const row of exact){
-              const d = distToRow(row);
-              if (d < bestD){ best = row; bestD = d; }
+            if(!chosen){
+              for(const row of matches){
+                const na = normalizeKRAddr(row.address);
+                if(nJib && na===nJib){ chosen = row; break; }
+              }
             }
+            if(!chosen) chosen = matches[0];
 
-            // 마커가 안 보여도(필터로 가려져도) row의 좌표로 바로 카드 오픈
-            const pos = (best._marker?.getPosition())
-                    || (isFinite(best.lat) && isFinite(best.lng) ? new kakao.maps.LatLng(Number(best.lat), Number(best.lng)) : latlng);
+            // 보라색 검색 핀/패널 억제
+            closeSearchOverlay();
+            clearSearchMarker();
+            $("fabSearch")?.classList.add('searched'); // 테두리 효과는 유지
 
-            // 기존 검색핀/패널은 사용하지 않고 바로 이동+카드
-            smoothPanZoomTo(pos, 1);
-            openCardFor(best, pos, true);
-            showSearchHint("등록 매물과 주소가 정확히 일치합니다");
-            return;
+            // 해당 매물 카드/말풍선 띄우기
+            const pos =
+              (chosen._marker && chosen._marker.getPosition && chosen._marker.getPosition())
+              || (isFinite(chosen.lat) && isFinite(chosen.lng) ? new kakao.maps.LatLng(Number(chosen.lat), Number(chosen.lng)) : latlng);
+
+            // 카드 열고 지도 이동
+            openCardFor(chosen, pos, true);
+            nudgeIfEdge(pos);
+            return; // ✅ 여기서 종료(보라색 핀 X)
           }
 
-          // ✅ 2) 일치 매물 없으면 기존처럼 검색핀 + 주소 패널
+          // ② 매물 일치가 없으면 기존처럼 보라색 핀
           handlePinAndZoom(latlng, label);
           return;
         }
 
-        // (도로명/지번으로 매칭 실패 시) 키워드 검색에서도 같은 방식으로 시도
+        // 주소검색 실패 → 장소검색으로 보조
         const places = new kakao.maps.services.Places();
         places.keywordSearch(q, function(r, s){
           if(s === kakao.maps.services.Status.OK && r && r.length){
-            const item  = r[0];
-            const latlng= new kakao.maps.LatLng(Number(item.y), Number(item.x));
-            // Kakao 장소검색은 주소 필드가 케이스에 따라 다름
-            const road  = item.road_address_name || item.road_address || "";
-            const jibun = item.address_name      || "";
-            const label = road || jibun || item.place_name || q;
+            const item   = r[0];
+            const latlng = new kakao.maps.LatLng(Number(item.y), Number(item.x));
+            const label  = item.place_name || q;
 
-            // ✅ 지오코딩 성공 블록 안
-            const exact = findListingsByAddressFlexible(road, jibun);
-            if (exact.length){
-              // 가장 가까운 것 1개 선택 (좌표 없는 경우 대비)
-              let best = exact[0], bestD = Infinity;
-              const tLat = latlng.getLat(), tLng = latlng.getLng();
-              for(const row of exact){
-                const la = Number(row.lat), ln = Number(row.lng);
-                if(!isFinite(la)||!isFinite(ln)) continue;
-                const dLa=(la-tLat)*Math.PI/180, dLn=(ln-tLng)*Math.PI/180;
-                const a = Math.sin(dLa/2)**2 + Math.cos(tLat*Math.PI/180)*Math.cos(la*Math.PI/180)*Math.sin(dLn/2)**2;
-                const d = 2*6371000*Math.asin(Math.sqrt(a));
-                if(d<bestD){ best=row; bestD=d; }
-              }
-              const pos = (best._marker?.getPosition())
-                      || (isFinite(best.lat)&&isFinite(best.lng) ? new kakao.maps.LatLng(Number(best.lat), Number(best.lng)) : latlng);
-
-              // 🔒 검색핀/패널 완전 비활성화
+            // 장소명 결과도 정규화 매칭 시도(희박하지만 혹시 주소형 텍스트면 잡힘)
+            const matches = findListingsByNormalizedAddress([item.road_address_name, item.address_name, item.place_name, q]);
+            if(matches.length){
+              const chosen = matches[0];
               closeSearchOverlay();
-              $("fabSearch")?.classList.remove('searched');
-
-              smoothPanZoomTo(pos, 1);
-              openCardFor(best, pos, true);
-              showSearchHint("등록 매물 주소와 일치");
+              clearSearchMarker();
+              $("fabSearch")?.classList.add('searched');
+              const pos =
+                (chosen._marker && chosen._marker.getPosition && chosen._marker.getPosition())
+                || (isFinite(chosen.lat) && isFinite(chosen.lng) ? new kakao.maps.LatLng(Number(chosen.lat), Number(chosen.lng)) : latlng);
+              openCardFor(chosen, pos, true);
+              nudgeIfEdge(pos);
               return;
             }
 
@@ -1250,6 +1274,7 @@
         }, { size: 3 });
       });
     }
+
     function initSearchUI(){
       const box = $("fabSearch"), icon = $("fabHandle"), input = $("addrInput"), collapse = $("addrCollapse");
       if(!box || !icon) return;
